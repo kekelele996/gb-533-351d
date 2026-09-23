@@ -200,8 +200,9 @@ func seed(db *gorm.DB, cfg Config) error {
 		AlgorithmVersion: cfg.AlgorithmVersion, InputHash: "b6391a7f33bc8cb8681d56d1d7899593c2be1c1b0927a06db604dd4644e893a0",
 		IdempotencyKey: "seed-validation-cell-a17-v3", Attempt: 1, CollisionEventsJSON: string(collisions),
 		InterlockFindingsJSON: string(findings), RiskScore: 44, ValidationStatus: constants.ValidationReviewed,
-		Explanation: "One restricted-zone envelope and speed violation. Offline approximation only; not an authorization to operate.",
-		RequestedBy: engineer.ID, StartedAt: finished.Add(-2 * time.Second), FinishedAt: &finished,
+		Explanation:        "One restricted-zone envelope and speed violation. Offline approximation only; not an authorization to operate.",
+		RegressionDiffJSON: "{}",
+		RequestedBy:        engineer.ID, StartedAt: finished.Add(-2 * time.Second), FinishedAt: &finished,
 		ReviewedBy: &reviewerID, ReviewedAt: &reviewedAt, ReviewNote: "Guard geometry requires integrator revision before independent acceptance.",
 	}
 	return db.Create(&run).Error

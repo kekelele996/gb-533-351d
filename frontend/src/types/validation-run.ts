@@ -38,6 +38,43 @@ export interface ProgramSnapshot {
 
 export type ZoneSnapshot = Pick<SafetyZone, 'id' | 'name' | 'zone_type' | 'polygon_geojson' | 'min_height_mm' | 'max_height_mm' | 'speed_limit_mm_s' | 'access_rule' | 'version'>;
 
+export interface BaselineSummary {
+  id: number;
+  motion_program_id: number;
+  program_code: string;
+  program_version: number;
+  algorithm_version: string;
+  attempt: number;
+  accepted_at?: string;
+}
+
+export interface FindingIdentity {
+  key: string;
+  category: 'collision' | 'interlock';
+  code: string;
+  event?: string;
+  zone_id?: number;
+  zone_name?: string;
+  segment?: number;
+  evidence: string;
+}
+
+export interface FindingDiffBucket {
+  new: FindingIdentity[];
+  gone: FindingIdentity[];
+  persisted: FindingIdentity[];
+}
+
+export interface RegressionDiff {
+  baseline_run_id?: number;
+  compared_at: string;
+  collision: FindingDiffBucket;
+  interlock: FindingDiffBucket;
+  new_collision_count: number;
+  new_interlock_count: number;
+  has_new_findings: boolean;
+}
+
 export interface ValidationRun {
   id: number;
   motion_program_id: number;
@@ -55,6 +92,8 @@ export interface ValidationRun {
   risk_score: number;
   validation_status: ValidationStatus;
   explanation: string;
+  baseline?: BaselineSummary;
+  regression_diff: RegressionDiff;
   requested_by: number;
   started_at: string;
   finished_at?: string;

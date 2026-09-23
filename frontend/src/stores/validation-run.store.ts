@@ -17,8 +17,12 @@ export class ValidationRunStore {
     this.error.set('');
     this.api.list().pipe(finalize(() => this.loading.set(false))).subscribe({
       next: ({ data }) => {
+        const previousID = this.selected()?.id;
         this.items.set(data);
-        if (!this.selected() && data.length) this.selected.set(data[0]);
+        // Keep the viewed run in sync with the server copy so baseline bindings and
+        // diffs stay identical after a refresh or a baseline invalidation elsewhere.
+        const refreshed = (previousID ? data.find((item) => item.id === previousID) : undefined) ?? data[0];
+        this.selected.set(refreshed ?? null);
       },
       error: (error) => this.error.set(apiErrorMessage(error)),
     });

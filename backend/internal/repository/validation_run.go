@@ -2,9 +2,11 @@ package repository
 
 import (
 	"fmt"
+	"time"
 
 	"gorm.io/gorm"
 
+	"robot-cell-safety-envelope-validator/backend/internal/constants"
 	"robot-cell-safety-envelope-validator/backend/internal/model"
 )
 
@@ -66,6 +68,62 @@ func (repository *ValidationRunRepository) LatestByInput(inputHash, algorithmVer
 		return run, fmt.Errorf("find latest input run: %w", err)
 	}
 	return run, nil
+}
+
+// LatestAcceptedBaseline returns the most recently accepted run for the same work
+// unit, program code and algorithm version that was already accepted when the
+// candidate run finished. Voided runs and the candidate itself are excluded.
+func (repository *ValidationRunRepository) LatestAcceptedBaseline(robotCellID uint, programCode, algorithmVersion string, finishedAt time.Time, excludeID uint) (model.ValidationRun, error) {
+	var run model.ValidationRun
+	err := repository.db.
+		Joins("JOIN motion_programs ON motion_programs.id = validation_runs.motion_program_id").
+		Where("validation_runs.validation_status = ?", constants.ValidationAccepted).
+		Where("validation_runs.algorithm_version = ?", algorithmVersion).
+		Where("validation_runs.id <> ?", excludeID).
+		Where("motion_programs.robot_cell_id = ? AND motion_programs.program_code = ?", robotCellID, programCode).
+		Where("validation_runs.reviewed_at IS NOT NULL AND validation_runs.reviewed_at <= ?", finishedAt).
+		Order("validation_runs.reviewed_at DESC, validation_runs.id DESC").
+		First(&run).Error
+	if err != nil {
+		return run, fmt.Errorf("find latest accepted baseline: %w", err)
+	}
+	return run, nil
+}
+
+// ListByBaseline returns every non-voided run bound to the given baseline.
+func (repository *ValidationRunRepository) ListByBaseline(baselineID uint) ([]model.ValidationRun, error) {
+	var runs []model.ValidationRun
+	if err := repository.db.Preload("MotionProgram").
+		Where("baseline_run_id = ? AND validation_status <> ?", baselineID, constants.ValidationVoided).
+		Order("id ASC").Find(&runs).Error; err != nil {
+		return nil, fmt.Errorf("list runs by baseline: %w", err)
+	}
+	return runs, nil
+}
+
+// RebindBaseline points a run at its fallback baseline and replaces the stored diff.
+func (repository *ValidationRunRepository) RebindBaseline(id uint, baselineID *uint, diffJSON string) error {
+	if err := repository.db.Model(&model.ValidationRun{}).Where("id = ?", id).
+		Updates(map[string]any{"baseline_run_id": baselineID, "regression_diff_json": diffJSON}).Error; err != nil {
+		return fmt.Errorf("rebind baseline: %w", err)
+	}
+	return nil
+}
+
+// BaselineByIDs loads runs used as baselines in one query.
+func (repository *ValidationRunRepository) BaselineByIDs(ids []uint) (map[uint]model.ValidationRun, error) {
+	result := make(map[uint]model.ValidationRun, len(ids))
+	if len(ids) == 0 {
+		return result, nil
+	}
+	var runs []model.ValidationRun
+	if err := repository.db.Preload("MotionProgram").Where("id IN ?", ids).Find(&runs).Error; err != nil {
+		return nil, fmt.Errorf("load baseline runs: %w", err)
+	}
+	for _, run := range runs {
+		result[run.ID] = run
+	}
+	return result, nil
 }
 
 func (repository *ValidationRunRepository) SetSimulating(id uint) error {

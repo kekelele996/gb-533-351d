@@ -35,6 +35,46 @@ type ReviewValidationRequest struct {
 	Note string `json:"note" validate:"required,min=8,max=1000"`
 }
 
+// BaselineSummary describes the accepted run a validation run is regressed against.
+type BaselineSummary struct {
+	ID               uint       `json:"id"`
+	MotionProgramID  uint       `json:"motion_program_id"`
+	ProgramCode      string     `json:"program_code"`
+	ProgramVersion   int        `json:"program_version"`
+	AlgorithmVersion string     `json:"algorithm_version"`
+	Attempt          int        `json:"attempt"`
+	AcceptedAt       *time.Time `json:"accepted_at"`
+}
+
+// RegressionDiff classifies findings relative to the bound baseline.
+type RegressionDiff struct {
+	BaselineRunID     *uint             `json:"baseline_run_id"`
+	ComparedAt        time.Time         `json:"compared_at"`
+	Collision         FindingDiffBucket `json:"collision"`
+	Interlock         FindingDiffBucket `json:"interlock"`
+	NewCollisionCount int               `json:"new_collision_count"`
+	NewInterlockCount int               `json:"new_interlock_count"`
+	HasNewFindings    bool              `json:"has_new_findings"`
+}
+
+type FindingDiffBucket struct {
+	New       []FindingIdentity `json:"new"`
+	Gone      []FindingIdentity `json:"gone"`
+	Persisted []FindingIdentity `json:"persisted"`
+}
+
+// FindingIdentity is a stable, category-independent identifier for one finding.
+type FindingIdentity struct {
+	Key      string `json:"key"`
+	Category string `json:"category"`
+	Code     string `json:"code"`
+	Event    string `json:"event,omitempty"`
+	ZoneID   uint   `json:"zone_id,omitempty"`
+	ZoneName string `json:"zone_name,omitempty"`
+	Segment  *int   `json:"segment,omitempty"`
+	Evidence string `json:"evidence"`
+}
+
 type ValidationRunResponse struct {
 	ID                uint               `json:"id"`
 	MotionProgramID   uint               `json:"motion_program_id"`
@@ -52,6 +92,8 @@ type ValidationRunResponse struct {
 	RiskScore         float64            `json:"risk_score"`
 	ValidationStatus  string             `json:"validation_status"`
 	Explanation       string             `json:"explanation"`
+	Baseline          *BaselineSummary   `json:"baseline"`
+	RegressionDiff    RegressionDiff     `json:"regression_diff"`
 	RequestedBy       uint               `json:"requested_by"`
 	StartedAt         time.Time          `json:"started_at"`
 	FinishedAt        *time.Time         `json:"finished_at"`

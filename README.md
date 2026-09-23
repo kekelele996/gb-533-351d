@@ -21,6 +21,7 @@ docker compose ps
 - 包络仿真：将工具与负载半径扩张成扫掠包络，与启用区域的二维多边形和高度区间求交。
 - 联锁校验：检测缺失前置、顺序反转和有向循环，并输出逐条证据。
 - 人工复核：保留输入快照、算法版本、输入哈希、发现详情、评审和接受/作废记录。
+- 回归基线：同一工作单元、同一程序代码且算法版本一致的最新已接受运行自动绑定为基线，按碰撞发现和联锁发现列出新增、消失、仍存在；存在新增发现时评审通过也不能接受；基线作废后自动回退到上一已接受运行。
 - 审计中心：按操作者、request ID、实体和动作查询所有写操作的前后投影。
 
 ## 角色与本地账号
@@ -42,7 +43,7 @@ docker compose ps
 | `/cells` | `RobotCell`、`SafetyZone` | 建档、编辑、冻结布局、停用 |
 | `/zones` | `SafetyZone`、`RobotCell` | 画布绘制、修订、启用、停用 |
 | `/programs` | `MotionProgram`、`RobotCell`、`SafetyZone` | 导入、解析、就绪、激活、替代 |
-| `/validation` | `ValidationRun`、`MotionProgram`、`SafetyZone` | 仿真、证据回放、评审、接受、作废 |
+| `/validation` | `ValidationRun`、`MotionProgram`、`SafetyZone` | 仿真、证据回放、回归基线差异、评审、接受、作废 |
 | `/audit` | 四实体审计投影 | 操作者、request ID、实体和动作筛选 |
 
 共享组件：
@@ -76,6 +77,15 @@ queued -> simulating -> passed | failed -> reviewed -> accepted
 - 相同输入哈希与算法版本默认复用既有结果。
 - `failed` 结果可显式重试，新记录保存 `attempt` 和 `retry_of_id`，不会覆盖旧尝试。
 - `accepted` 只表示离线证据被独立记录，不等于机器人可运行。
+
+### 回归基线
+
+- 新运行完成时自动绑定当时最新基线：同一工作单元（`robot_cell_id`）、同一程序代码（`program_code`）且算法版本一致、已在该运行完成前接受的最新 `accepted` 运行；没有已接受前序运行时基线为空。
+- 基线绑定在完成时刻固定，之后不会因为更新的运行被接受而改变；程序版本、区域快照和输入哈希不同也可比较，因为匹配只依赖工作单元、程序代码与算法版本。
+- 发现以稳定标识分类：碰撞为 `segment_index + zone_id`（不随采样接触时刻、速度或净距变化），联锁为 `code + event + depends_on`。每个类别分别给出 `new`、`gone`、`persisted`，差异快照随运行存储。
+- 已绑定基线且存在新增碰撞或联锁发现时，即使评审已记录，`accept` 返回 409 `new_regression_findings`；无基线的首个运行没有可回归的对象，接受后即建立第一条基线。仅消失的发现不阻止接受。
+- 作废一个已接受基线时，事务内所有绑定它的未作废运行回退到上一已接受运行并重算分类；没有更早基线时绑定置空，全部发现重新计为新增。回退事件记录为 `validation_run.baseline_rebound` 审计动作。
+- 校验页展示绑定基线和两类三栏差异；绑定与分类由服务端存储并在每次详情/列表响应中返回，刷新后保持一致。
 
 ## 包络算法、假设与误差边界
 
@@ -240,6 +250,14 @@ npm --prefix frontend run build
 scripts/api_smoke.sh
 ```
 
+回归基线（自动绑定、新增/消失/仍存在分类、接受拦截、作废回退）的端到端检查需要全新空库：
+
+```bash
+JWT_SECRET=dev-secret-at-least-24-bytes DB_DRIVER=sqlite DB_DSN=/tmp/reg.db PORT=19533 \
+  go run ./backend/cmd/server
+scripts/regression_smoke.sh
+```
+
 ## Docker 部署
 
 ```bash
@@ -259,6 +277,8 @@ curl -fsS http://127.0.0.1:18533/api/healthz
 - **409 invalid_program_transition**：按 uploaded -> parsed -> ready -> active 顺序推进。
 - **仿真返回旧结果**：相同输入哈希和算法版本会复用；仅失败结果允许 `retry_failed=true` 创建新尝试。
 - **接受后仍显示风险**：预期行为。人工处置不会篡改碰撞、联锁或风险证据。
+- **409 new_regression_findings**：相对绑定基线出现了新的碰撞或联锁发现，评审通过也不能接受；需消除新增发现、修正后重跑，或由有权限者作废基线后重新绑定。
+- **基线消失/变化**：基线运行被作废后，绑定自动回退到上一已接受运行，差异会立即重算并在校验页反映。
 - **管理员接受返回 403**：如果管理员本人上传了该程序，自审隔离仍然生效。
 
 ## 停止
