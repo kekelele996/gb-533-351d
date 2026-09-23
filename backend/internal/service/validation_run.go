@@ -51,8 +51,7 @@ func (service *ValidationRunService) Create(request dto.CreateValidationRunReque
 		return dto.ValidationRunResponse{}, false, BadRequest("invalid_idempotency_key", "Idempotency-Key must contain 8 to 120 characters")
 	}
 	if existing, err := service.repository.FindByIdempotencyKey(idempotencyKey); err == nil {
-		response, responseErr := validationResponse(existing)
-		response.Reused = true
+		response, responseErr := service.reuseResponse(existing)
 		return response, true, responseErr
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return dto.ValidationRunResponse{}, false, Internal("could not check idempotency key", err)
@@ -83,8 +82,7 @@ func (service *ValidationRunService) Create(request dto.CreateValidationRunReque
 	attempt, retryOfID := 1, (*uint)(nil)
 	if previous, err := service.repository.LatestByInput(inputHash, service.algorithmVersion); err == nil {
 		if previous.ValidationStatus != constants.ValidationFailed || !request.RetryFailed {
-			response, responseErr := validationResponse(previous)
-			response.Reused = true
+			response, responseErr := service.reuseResponse(previous)
 			return response, true, responseErr
 		}
 		attempt, retryOfID = previous.Attempt+1, &previous.ID
@@ -97,10 +95,20 @@ func (service *ValidationRunService) Create(request dto.CreateValidationRunReque
 	collisionJSON, _ := json.Marshal(collisions)
 	findingJSON, _ := json.Marshal(findings)
 	started, finished := time.Now().UTC(), time.Now().UTC()
+	// The regression baseline is the latest accepted run for the same cell,
+	// program code and algorithm version at completion time.
+	baseline, baselineErr := service.repository.LatestAcceptedBaseline(program.RobotCellID, program.ProgramCode, service.algorithmVersion)
+	if baselineErr != nil && !errors.Is(baselineErr, gorm.ErrRecordNotFound) {
+		return dto.ValidationRunResponse{}, false, Internal("could not resolve regression baseline", baselineErr)
+	}
+	var baselineRunID *uint
+	if baselineErr == nil {
+		baselineRunID = &baseline.ID
+	}
 	run := model.ValidationRun{
 		MotionProgramID: program.ID, ZoneSnapshot: string(zoneSnapshot), ProgramSnapshot: string(programSnapshot),
 		AlgorithmVersion: service.algorithmVersion, InputHash: inputHash, IdempotencyKey: idempotencyKey,
-		Attempt: attempt, RetryOfID: retryOfID, CollisionEventsJSON: string(collisionJSON),
+		Attempt: attempt, RetryOfID: retryOfID, BaselineRunID: baselineRunID, CollisionEventsJSON: string(collisionJSON),
 		InterlockFindingsJSON: string(findingJSON), RiskScore: riskScore, ValidationStatus: constants.ValidationQueued,
 		Explanation: explanation, RequestedBy: actor.ID, StartedAt: started,
 	}
@@ -118,13 +126,13 @@ func (service *ValidationRunService) Create(request dto.CreateValidationRunReque
 		}
 		return service.system.RecordAuditTx(tx, actor, requestID, "validation_run.completed", "validation_run", auditID(run.ID), map[string]any{
 			"algorithm_version": service.algorithmVersion, "input_hash": inputHash, "attempt": attempt,
+			"baseline_run_id": baselineRunID,
 		}, nil, map[string]any{"status": status, "risk_score": riskScore, "collision_count": len(collisions), "interlock_finding_count": len(findings)})
 	})
 	if err != nil {
 		if repository.IsUniqueViolation(err) {
 			if existing, lookupErr := service.repository.FindByIdempotencyKey(idempotencyKey); lookupErr == nil {
-				response, responseErr := validationResponse(existing)
-				response.Reused = true
+				response, responseErr := service.reuseResponse(existing)
 				return response, true, responseErr
 			}
 			return dto.ValidationRunResponse{}, false, Conflict("idempotency_conflict", "idempotency key is already in use", err)
@@ -135,12 +143,33 @@ func (service *ValidationRunService) Create(request dto.CreateValidationRunReque
 	return response, false, err
 }
 
+// reuseResponse builds an enriched response for an idempotently reused run so
+// its bound baseline and differences are reported exactly like a fresh GET.
+func (service *ValidationRunService) reuseResponse(run model.ValidationRun) (dto.ValidationRunResponse, error) {
+	response, err := validationResponse(run)
+	if err != nil {
+		return dto.ValidationRunResponse{}, err
+	}
+	response.Reused = true
+	if err := service.enrichBaseline(&response, map[uint]model.ValidationRun{}); err != nil {
+		return dto.ValidationRunResponse{}, err
+	}
+	return response, nil
+}
+
 func (service *ValidationRunService) Get(id uint) (dto.ValidationRunResponse, error) {
 	run, err := service.repository.Get(id)
 	if err != nil {
 		return dto.ValidationRunResponse{}, MapRepositoryError("validation run", err)
 	}
-	return validationResponse(run)
+	response, err := validationResponse(run)
+	if err != nil {
+		return dto.ValidationRunResponse{}, Internal("stored validation evidence is invalid", err)
+	}
+	if err := service.enrichBaseline(&response, map[uint]model.ValidationRun{}); err != nil {
+		return dto.ValidationRunResponse{}, err
+	}
+	return response, nil
 }
 
 func (service *ValidationRunService) List(page, pageSize int, programID uint, status string) ([]dto.ValidationRunResponse, dto.PageMeta, error) {
@@ -149,14 +178,74 @@ func (service *ValidationRunService) List(page, pageSize int, programID uint, st
 		return nil, dto.PageMeta{}, Internal("could not list validation runs", err)
 	}
 	responses := make([]dto.ValidationRunResponse, 0, len(runs))
+	baselineIDs := make([]uint, 0, len(runs))
+	seen := map[uint]bool{}
+	for _, run := range runs {
+		if run.BaselineRunID != nil && !seen[*run.BaselineRunID] {
+			seen[*run.BaselineRunID] = true
+			baselineIDs = append(baselineIDs, *run.BaselineRunID)
+		}
+	}
+	baselineCache := map[uint]model.ValidationRun{}
+	if len(baselineIDs) > 0 {
+		baselines, loadErr := service.repository.FindBaselinesByID(baselineIDs)
+		if loadErr != nil {
+			return nil, dto.PageMeta{}, Internal("could not load regression baselines", loadErr)
+		}
+		for _, baseline := range baselines {
+			baselineCache[baseline.ID] = baseline
+		}
+	}
 	for _, run := range runs {
 		response, err := validationResponse(run)
 		if err != nil {
 			return nil, dto.PageMeta{}, Internal("stored validation evidence is invalid", err)
 		}
+		if err := service.enrichBaseline(&response, baselineCache); err != nil {
+			return nil, dto.PageMeta{}, err
+		}
 		responses = append(responses, response)
 	}
 	return responses, PageMeta(page, pageSize, total), nil
+}
+
+// enrichBaseline attaches the bound baseline summary and the classified
+// finding differences. Runs without a binding and runs whose baseline was
+// deleted return no regression block.
+func (service *ValidationRunService) enrichBaseline(response *dto.ValidationRunResponse, cache map[uint]model.ValidationRun) error {
+	if response.BaselineRunID == nil {
+		return nil
+	}
+	baseline, cached := cache[*response.BaselineRunID]
+	if !cached {
+		loaded, err := service.repository.Get(*response.BaselineRunID)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) || strings.Contains(err.Error(), "record not found") {
+				return nil
+			}
+			return Internal("could not load regression baseline", err)
+		}
+		baseline = loaded
+		cache[*response.BaselineRunID] = baseline
+	}
+	response.Regression = buildRegressionBaselineFrom(response.CollisionEvents, response.InterlockFindings, baseline, mustUnmarshalCollisions(baseline.CollisionEventsJSON), mustUnmarshalFindings(baseline.InterlockFindingsJSON))
+	return nil
+}
+
+func mustUnmarshalCollisions(raw string) []dto.CollisionEvent {
+	var collisions []dto.CollisionEvent
+	if err := json.Unmarshal([]byte(raw), &collisions); err != nil {
+		return []dto.CollisionEvent{}
+	}
+	return collisions
+}
+
+func mustUnmarshalFindings(raw string) []dto.InterlockFinding {
+	var findings []dto.InterlockFinding
+	if err := json.Unmarshal([]byte(raw), &findings); err != nil {
+		return []dto.InterlockFinding{}
+	}
+	return findings
 }
 
 func (service *ValidationRunService) Review(id uint, note string, actor dto.Actor, requestID string) (dto.ValidationRunResponse, error) {
@@ -177,7 +266,7 @@ func (service *ValidationRunService) Review(id uint, note string, actor dto.Acto
 	if err := service.system.RecordAudit(actor, requestID, "validation_run.reviewed", "validation_run", auditID(id), map[string]any{"note_length": len(note)}, validationSummary(before), validationSummary(after)); err != nil {
 		return dto.ValidationRunResponse{}, err
 	}
-	return validationResponse(after)
+	return service.Get(id)
 }
 
 func (service *ValidationRunService) Accept(id uint, note string, actor dto.Actor, requestID string) (dto.ValidationRunResponse, error) {
@@ -191,6 +280,31 @@ func (service *ValidationRunService) Accept(id uint, note string, actor dto.Acto
 	if before.ValidationStatus != constants.ValidationReviewed {
 		return dto.ValidationRunResponse{}, Conflict("invalid_validation_transition", "only reviewed runs can be accepted", repository.ErrStateConflict)
 	}
+	// Regression gate: findings the bound accepted baseline did not contain
+	// make acceptance impossible even after a positive human review.
+	if before.BaselineRunID != nil {
+		baseline, baselineErr := service.repository.Get(*before.BaselineRunID)
+		if baselineErr != nil && !errors.Is(baselineErr, gorm.ErrRecordNotFound) {
+			return dto.ValidationRunResponse{}, Internal("could not load regression baseline", baselineErr)
+		}
+		if baselineErr == nil {
+			var runCollisions []dto.CollisionEvent
+			if err := json.Unmarshal([]byte(before.CollisionEventsJSON), &runCollisions); err != nil {
+				return dto.ValidationRunResponse{}, Internal("stored validation evidence is invalid", err)
+			}
+			var runFindings []dto.InterlockFinding
+			if err := json.Unmarshal([]byte(before.InterlockFindingsJSON), &runFindings); err != nil {
+				return dto.ValidationRunResponse{}, Internal("stored validation evidence is invalid", err)
+			}
+			regression := buildRegressionBaselineFrom(runCollisions, runFindings, baseline,
+				mustUnmarshalCollisions(baseline.CollisionEventsJSON), mustUnmarshalFindings(baseline.InterlockFindingsJSON))
+			if regression.HasNewFindings {
+				return dto.ValidationRunResponse{}, Conflict("new_regression_findings",
+					fmt.Sprintf("acceptance blocked: %d new envelope finding(s) and %d new interlock finding(s) versus accepted baseline #%d; resolve the regressions or establish a new accepted baseline",
+						len(regression.CollisionDiff.Added), len(regression.InterlockDiff.Added), baseline.ID), repository.ErrStateConflict)
+			}
+		}
+	}
 	if err := service.repository.Review(id, constants.ValidationReviewed, constants.ValidationAccepted, actor.ID, strings.TrimSpace(note)); err != nil {
 		return dto.ValidationRunResponse{}, Conflict("state_conflict", "validation state changed concurrently", err)
 	}
@@ -198,10 +312,10 @@ func (service *ValidationRunService) Accept(id uint, note string, actor dto.Acto
 	if err != nil {
 		return dto.ValidationRunResponse{}, Internal("could not reload validation run", err)
 	}
-	if err := service.system.RecordAudit(actor, requestID, "validation_run.accepted", "validation_run", auditID(id), map[string]any{"note_length": len(note), "decision_boundary": "offline evidence only"}, validationSummary(before), validationSummary(after)); err != nil {
+	if err := service.system.RecordAudit(actor, requestID, "validation_run.accepted", "validation_run", auditID(id), map[string]any{"note_length": len(note), "decision_boundary": "offline evidence only", "baseline_run_id": before.BaselineRunID}, validationSummary(before), validationSummary(after)); err != nil {
 		return dto.ValidationRunResponse{}, err
 	}
-	return validationResponse(after)
+	return service.Get(id)
 }
 
 func (service *ValidationRunService) Void(id uint, note string, actor dto.Actor, requestID string) (dto.ValidationRunResponse, error) {
@@ -213,17 +327,45 @@ func (service *ValidationRunService) Void(id uint, note string, actor dto.Actor,
 	if !allowed {
 		return dto.ValidationRunResponse{}, Conflict("invalid_validation_transition", "this validation run cannot be voided from its current state", repository.ErrStateConflict)
 	}
-	if err := service.repository.Review(id, before.ValidationStatus, constants.ValidationVoided, actor.ID, strings.TrimSpace(note)); err != nil {
-		return dto.ValidationRunResponse{}, Conflict("state_conflict", "validation state changed concurrently", err)
+	// When an accepted baseline is voided, every run bound to it falls back to
+	// the previous accepted run for the same cell, program code and algorithm.
+	var fallbackID *uint
+	rebound := int64(0)
+	if before.ValidationStatus == constants.ValidationAccepted {
+		previous, previousErr := service.repository.PreviousAcceptedBaseline(before.MotionProgram.RobotCellID, before.MotionProgram.ProgramCode, before.AlgorithmVersion, id)
+		if previousErr == nil {
+			fallbackID = &previous.ID
+		} else if !errors.Is(previousErr, gorm.ErrRecordNotFound) {
+			return dto.ValidationRunResponse{}, Internal("could not resolve fallback baseline", previousErr)
+		}
 	}
-	after, err := service.repository.Get(id)
+	err = service.db.Transaction(func(tx *gorm.DB) error {
+		repo := service.repository.WithDB(tx)
+		if err := repo.Review(id, before.ValidationStatus, constants.ValidationVoided, actor.ID, strings.TrimSpace(note)); err != nil {
+			return err
+		}
+		if before.ValidationStatus == constants.ValidationAccepted {
+			affected, rebindErr := repo.RebindBaselines(id, fallbackID)
+			if rebindErr != nil {
+				return rebindErr
+			}
+			rebound = affected
+			if err := service.system.RecordAuditTx(tx, actor, requestID, "validation_run.baseline_rebound", "validation_run", auditID(id),
+				map[string]any{"voided_baseline_run_id": id, "fallback_baseline_run_id": fallbackID, "rebound_run_count": rebound}, nil, nil); err != nil {
+				return err
+			}
+		}
+		return service.system.RecordAuditTx(tx, actor, requestID, "validation_run.voided", "validation_run", auditID(id),
+			map[string]any{"note_length": len(note), "fallback_baseline_run_id": fallbackID, "rebound_run_count": rebound},
+			validationSummary(before), map[string]any{"validation_status": constants.ValidationVoided})
+	})
 	if err != nil {
-		return dto.ValidationRunResponse{}, Internal("could not reload validation run", err)
+		if errors.Is(err, repository.ErrStateConflict) {
+			return dto.ValidationRunResponse{}, Conflict("state_conflict", "validation state changed concurrently", err)
+		}
+		return dto.ValidationRunResponse{}, Internal("could not void validation run", err)
 	}
-	if err := service.system.RecordAudit(actor, requestID, "validation_run.voided", "validation_run", auditID(id), map[string]any{"note_length": len(note)}, validationSummary(before), validationSummary(after)); err != nil {
-		return dto.ValidationRunResponse{}, err
-	}
-	return validationResponse(after)
+	return service.Get(id)
 }
 
 func buildZoneSnapshot(zones []model.SafetyZone) ([]byte, []geometry.ZoneVolume, error) {
@@ -315,6 +457,7 @@ func validationResponse(run model.ValidationRun) (dto.ValidationRunResponse, err
 		ProgramVersion: run.MotionProgram.Version, ZoneSnapshot: json.RawMessage(run.ZoneSnapshot),
 		ProgramSnapshot: json.RawMessage(run.ProgramSnapshot), AlgorithmVersion: run.AlgorithmVersion,
 		InputHash: run.InputHash, IdempotencyKey: run.IdempotencyKey, Attempt: run.Attempt, RetryOfID: run.RetryOfID,
+		BaselineRunID:   run.BaselineRunID,
 		CollisionEvents: collisions, InterlockFindings: findings, RiskScore: run.RiskScore,
 		ValidationStatus: run.ValidationStatus, Explanation: run.Explanation, RequestedBy: run.RequestedBy,
 		StartedAt: run.StartedAt, FinishedAt: run.FinishedAt, ReviewedBy: run.ReviewedBy,

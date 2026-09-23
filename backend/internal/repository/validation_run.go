@@ -2,6 +2,7 @@ package repository
 
 import (
 	"fmt"
+	"sort"
 
 	"gorm.io/gorm"
 
@@ -49,6 +50,93 @@ func (repository *ValidationRunRepository) List(page, pageSize int, programID ui
 		return nil, 0, fmt.Errorf("list validation runs: %w", err)
 	}
 	return runs, total, nil
+}
+
+// LatestAcceptedBaseline returns the most recently accepted run for the same
+// robot cell, program code and algorithm version. Such runs are the only
+// eligible regression baselines.
+func (repository *ValidationRunRepository) LatestAcceptedBaseline(cellID uint, programCode, algorithmVersion string) (model.ValidationRun, error) {
+	runs, err := repository.acceptedBaselines(cellID, programCode, algorithmVersion)
+	if err != nil {
+		return model.ValidationRun{}, err
+	}
+	if len(runs) == 0 {
+		return model.ValidationRun{}, fmt.Errorf("find latest accepted baseline: %w", gorm.ErrRecordNotFound)
+	}
+	return runs[0], nil
+}
+
+// PreviousAcceptedBaseline returns the accepted run immediately before anchor
+// in (reviewed_at, id) order, excluding the anchor itself. Ordering is resolved
+// in Go so timestamp storage differences (e.g. SQLite CURRENT_TIMESTAMP) cannot
+// skew the fallback.
+func (repository *ValidationRunRepository) PreviousAcceptedBaseline(cellID uint, programCode, algorithmVersion string, anchorID uint) (model.ValidationRun, error) {
+	runs, err := repository.acceptedBaselines(cellID, programCode, algorithmVersion)
+	if err != nil {
+		return model.ValidationRun{}, err
+	}
+	for index, run := range runs {
+		if run.ID == anchorID && index+1 < len(runs) {
+			return runs[index+1], nil
+		}
+	}
+	return model.ValidationRun{}, fmt.Errorf("find previous accepted baseline: %w", gorm.ErrRecordNotFound)
+}
+
+func (repository *ValidationRunRepository) acceptedBaselines(cellID uint, programCode, algorithmVersion string) ([]model.ValidationRun, error) {
+	var runs []model.ValidationRun
+	if err := repository.db.Model(&model.ValidationRun{}).
+		Joins("JOIN motion_programs ON motion_programs.id = validation_runs.motion_program_id").
+		Where("validation_runs.validation_status = ?", "accepted").
+		Where("motion_programs.robot_cell_id = ? AND motion_programs.program_code = ?", cellID, programCode).
+		Where("validation_runs.algorithm_version = ?", algorithmVersion).
+		Find(&runs).Error; err != nil {
+		return nil, fmt.Errorf("list accepted baselines: %w", err)
+	}
+	// Order in Go: the SQLite and PostgreSQL drivers parse stored timestamps
+	// into time.Time, so lexical differences in on-disk formats (with/without
+	// fractional seconds or timezone offsets) cannot change baseline order.
+	sort.SliceStable(runs, func(i, j int) bool {
+		left, right := runs[i].ReviewedAt, runs[j].ReviewedAt
+		switch {
+		case left == nil && right == nil:
+			return runs[i].ID > runs[j].ID
+		case left == nil:
+			return false
+		case right == nil:
+			return true
+		case left.Equal(*right):
+			return runs[i].ID > runs[j].ID
+		default:
+			return left.After(*right)
+		}
+	})
+	return runs, nil
+}
+
+// FindBaselinesByID loads the runs referenced as baselines.
+func (repository *ValidationRunRepository) FindBaselinesByID(ids []uint) ([]model.ValidationRun, error) {
+	var runs []model.ValidationRun
+	if len(ids) == 0 {
+		return runs, nil
+	}
+	if err := repository.db.Preload("MotionProgram").Where("id IN ?", ids).Find(&runs).Error; err != nil {
+		return nil, fmt.Errorf("find baseline runs: %w", err)
+	}
+	return runs, nil
+}
+
+// RebindBaselines moves every run whose baseline was voided onto the fallback
+// baseline (or clears the binding when no earlier accepted run remains). The
+// voided run itself is excluded because it is no longer a baseline candidate.
+func (repository *ValidationRunRepository) RebindBaselines(voidedID uint, fallbackID *uint) (int64, error) {
+	result := repository.db.Model(&model.ValidationRun{}).
+		Where("baseline_run_id = ? AND id <> ?", voidedID, voidedID).
+		Update("baseline_run_id", fallbackID)
+	if result.Error != nil {
+		return 0, fmt.Errorf("rebind validation baselines: %w", result.Error)
+	}
+	return result.RowsAffected, nil
 }
 
 func (repository *ValidationRunRepository) FindByIdempotencyKey(key string) (model.ValidationRun, error) {

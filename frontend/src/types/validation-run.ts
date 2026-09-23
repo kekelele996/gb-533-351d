@@ -23,6 +23,38 @@ export interface InterlockFinding {
   evidence: string;
 }
 
+export interface BaselineSummary {
+  id: number;
+  motion_program_id: number;
+  program_code: string;
+  program_version: number;
+  algorithm_version: string;
+  validation_status: string;
+  accepted_at?: string;
+}
+
+export type CollisionDiff = CollisionEvent;
+export type InterlockDiff = InterlockFinding;
+
+export interface FindingCategoryDiff {
+  added: CollisionDiff[];
+  removed: CollisionDiff[];
+  persisted: CollisionDiff[];
+}
+
+export interface InterlockCategoryDiff {
+  added: InterlockDiff[];
+  removed: InterlockDiff[];
+  persisted: InterlockDiff[];
+}
+
+export interface RegressionBaseline {
+  bound: BaselineSummary;
+  collision_diff: FindingCategoryDiff;
+  interlock_diff: InterlockCategoryDiff;
+  has_new_findings: boolean;
+}
+
 export interface ProgramSnapshot {
   id: number;
   robot_cell_id: number;
@@ -50,6 +82,7 @@ export interface ValidationRun {
   idempotency_key: string;
   attempt: number;
   retry_of_id?: number;
+  baseline_run_id?: number;
   collision_events: CollisionEvent[];
   interlock_findings: InterlockFinding[];
   risk_score: number;
@@ -62,6 +95,7 @@ export interface ValidationRun {
   reviewed_at?: string;
   review_note: string;
   reused: boolean;
+  regression?: RegressionBaseline;
 }
 
 export interface AuditEvent {

@@ -99,6 +99,50 @@ require_json '.data.validation_status == "reviewed"' "reviewed state"
 request "reviewer accepts evidence" 200 POST "/validations/$run_id/accept" "$reviewer_token" '{"note":"Evidence accepted for planning; site authority remains separate."}'
 require_json '.data.validation_status == "accepted" and .data.risk_score > 0' "acceptance preserves objective risk"
 
+# --- Regression baselines -------------------------------------------------
+# Baseline #1: same program code with a clean trajectory, accepted first.
+clean_payload="$(jq -nc --argjson cell "$cell_id" '{robot_cell_id:$cell,program_code:"QA-BASELINE-533",version:1,trajectory:[{x_mm:0,y_mm:-1200,z_mm:700,time_ms:0,speed_mm_s:300},{x_mm:400,y_mm:-1200,z_mm:700,time_ms:2000,speed_mm_s:300}],tool_radius_mm:60,payload_radius_mm:40,interlock_sequence:[{name:"emergency_stop_reset",sequence:1,depends_on:[]},{name:"gate_locked",sequence:2,depends_on:["emergency_stop_reset"]}]}')"
+request "programmer imports clean baseline program" 201 POST "/programs" "$programmer_token" "$clean_payload"
+clean_program_id="$(jq -r '.data.id' <<<"$last_body")"
+for target in parsed ready active; do request "baseline program -> $target" 200 POST "/programs/$clean_program_id/transition" "$programmer_token" "{\"target_state\":\"$target\"}"; done
+request "first clean run has no baseline" 201 POST "/validations" "$engineer_token" "$(jq -nc --argjson program "$clean_program_id" '{motion_program_id:$program}')" "qa-baseline-533-clean-1"
+clean_run_id="$(jq -r '.data.id' <<<"$last_body")"
+require_json '.data.validation_status == "passed" and (.data.baseline_run_id == null) and (.data.regression == null)' "first run is unbound"
+request "review clean run" 200 POST "/validations/$clean_run_id/review" "$reviewer_token" '{"note":"Clean offline evidence reviewed for regression baseline."}'
+request "accept clean baseline" 200 POST "/validations/$clean_run_id/accept" "$reviewer_token" '{"note":"Clean baseline accepted as the regression reference."}'
+require_json '.data.validation_status == "accepted"' "clean baseline accepted"
+
+# Baseline #2: same program code, trajectory now crosses the restricted gate.
+regressed_payload="$(jq -nc --argjson cell "$cell_id" '{robot_cell_id:$cell,program_code:"QA-BASELINE-533",version:2,trajectory:[{x_mm:0,y_mm:0,z_mm:700,time_ms:0,speed_mm_s:450},{x_mm:1200,y_mm:0,z_mm:700,time_ms:2000,speed_mm_s:450}],tool_radius_mm:60,payload_radius_mm:40,interlock_sequence:[{name:"emergency_stop_reset",sequence:1,depends_on:[]},{name:"gate_locked",sequence:2,depends_on:["emergency_stop_reset"]}]}')"
+request "programmer imports regressed program" 201 POST "/programs" "$programmer_token" "$regressed_payload"
+regressed_program_id="$(jq -r '.data.id' <<<"$last_body")"
+for target in parsed ready active; do request "regressed program -> $target" 200 POST "/programs/$regressed_program_id/transition" "$programmer_token" "{\"target_state\":\"$target\"}"; done
+request "regressed run binds accepted baseline" 201 POST "/validations" "$engineer_token" "$(jq -nc --argjson program "$regressed_program_id" '{motion_program_id:$program}')" "qa-baseline-533-regressed-1"
+regressed_run_id="$(jq -r '.data.id' <<<"$last_body")"
+require_json ".data.baseline_run_id == $clean_run_id and .data.regression.has_new_findings == true and (.data.regression.collision_diff.added | length) >= 1 and (.data.regression.collision_diff.added[0].zone_name == \"QA restricted gate\")" "new collision classified against baseline"
+request "regressed detail stays consistent after refresh" 200 GET "/validations/$regressed_run_id" "$auditor_token"
+require_json ".data.regression.bound.id == $clean_run_id and (.data.regression.collision_diff.added | length) >= 1" "detail keeps bound baseline and diff"
+request "review regressed run" 200 POST "/validations/$regressed_run_id/review" "$reviewer_token" '{"note":"Regression evidence reviewed; acceptance must remain blocked."}'
+request "acceptance blocked by new findings" 409 POST "/validations/$regressed_run_id/accept" "$reviewer_token" '{"note":"Reviewer attempt must be refused while new findings exist."}'
+require_json '.error.code == "new_regression_findings"' "regression gate error code"
+
+# A third program version with the gate violation resolved: finding is removed
+# relative to the bound baseline, so the run may be accepted.
+resolved_payload="$(jq -nc --argjson cell "$cell_id" '{robot_cell_id:$cell,program_code:"QA-BASELINE-533",version:3,trajectory:[{x_mm:0,y_mm:-1200,z_mm:700,time_ms:0,speed_mm_s:300},{x_mm:400,y_mm:-1200,z_mm:700,time_ms:2000,speed_mm_s:300}],tool_radius_mm:60,payload_radius_mm:40,interlock_sequence:[{name:"emergency_stop_reset",sequence:1,depends_on:[]},{name:"gate_locked",sequence:2,depends_on:["emergency_stop_reset"]}]}')"
+request "programmer imports resolved program" 201 POST "/programs" "$programmer_token" "$resolved_payload"
+resolved_program_id="$(jq -r '.data.id' <<<"$last_body")"
+for target in parsed ready active; do request "resolved program -> $target" 200 POST "/programs/$resolved_program_id/transition" "$programmer_token" "{\"target_state\":\"$target\"}"; done
+request "resolved run still binds clean baseline" 201 POST "/validations" "$engineer_token" "$(jq -nc --argjson program "$resolved_program_id" '{motion_program_id:$program}')" "qa-baseline-533-resolved-1"
+resolved_run_id="$(jq -r '.data.id' <<<"$last_body")"
+require_json ".data.baseline_run_id == $clean_run_id and .data.regression.has_new_findings == false and (.data.regression.collision_diff.added | length) == 0" "resolved run has no new findings"
+
+# Voiding the baseline does not affect already-bound diffs (there were no new
+# findings), and the regressed run simply loses its binding since no earlier
+# accepted run remains.
+request "void clean baseline" 200 POST "/validations/$clean_run_id/void" "$reviewer_token" '{"note":"Baseline withdrawn; dependent runs must unbind."}'
+request "regressed run reloads without baseline" 200 GET "/validations/$regressed_run_id" "$auditor_token"
+require_json '.data.baseline_run_id == null and (.data.regression == null)' "voided baseline unbinds dependent run"
+
 self_program="$(jq -nc --argjson cell "$cell_id" '{robot_cell_id:$cell,program_code:"QA-SELF-533",version:1,trajectory:[{x_mm:0,y_mm:0,z_mm:700,time_ms:0},{x_mm:1200,y_mm:0,z_mm:700,time_ms:3000}],tool_radius_mm:100,payload_radius_mm:80,interlock_sequence:[{name:"gate_locked",sequence:1,depends_on:[]}]}' )"
 request "admin imports self-review program" 201 POST "/programs" "$admin_token" "$self_program"
 self_program_id="$(jq -r '.data.id' <<<"$last_body")"

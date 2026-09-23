@@ -31,15 +31,20 @@ export class ValidationRunStore {
   }
   review(run: ValidationRun, note: string): void { this.mutate(this.api.review(run.id, note)); }
   accept(run: ValidationRun, note: string): void { this.mutate(this.api.accept(run.id, note)); }
-  void(run: ValidationRun, note: string): void { this.mutate(this.api.void(run.id, note)); }
+  void(run: ValidationRun, note: string): void {
+    // Voiding an accepted baseline rebinds other runs, so the register must be
+    // refreshed to stay consistent.
+    this.mutate(this.api.void(run.id, note), true);
+  }
 
-  private mutate(request: ReturnType<ValidationRunApi['create']>): void {
+  private mutate(request: ReturnType<ValidationRunApi['create']>, reloadAfter = false): void {
     this.loading.set(true);
     this.error.set('');
     request.pipe(finalize(() => this.loading.set(false))).subscribe({
       next: ({ data }) => {
         this.items.update((items) => [data, ...items.filter((item) => item.id !== data.id)]);
         this.selected.set(data);
+        if (reloadAfter) this.load();
       },
       error: (error) => this.error.set(apiErrorMessage(error)),
     });

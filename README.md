@@ -21,6 +21,7 @@ docker compose ps
 - 包络仿真：将工具与负载半径扩张成扫掠包络，与启用区域的二维多边形和高度区间求交。
 - 联锁校验：检测缺失前置、顺序反转和有向循环，并输出逐条证据。
 - 人工复核：保留输入快照、算法版本、输入哈希、发现详情、评审和接受/作废记录。
+- 程序回归基线：新运行自动绑定同一工作单元、同一程序代码、同一算法版本的最新已接受运行，并按碰撞发现和联锁发现列出新增、消失、仍存在；存在新增发现时接受被拒绝；基线作废后回退到上一已接受运行。
 - 审计中心：按操作者、request ID、实体和动作查询所有写操作的前后投影。
 
 ## 角色与本地账号
@@ -50,6 +51,7 @@ docker compose ps
 - `CellStateBadge`：状态颜色同时配合图标和文字，在工作单元、程序、区域和校验页复用。
 - `SafetyCanvas`：区域页可点选绘制，工作单元、程序和校验页显示真实区域/轨迹快照。
 - `FindingDrawer`：程序、校验和审计页展开联锁、碰撞或变更证据。
+- `RegressionBaseline`：校验页展示绑定基线和碰撞/联锁的新增、消失、仍存在分类。
 - `useAuth` 与 `useValidationRun`：集中注入认证权限和校验运行 store。
 
 ## 状态流
@@ -76,6 +78,24 @@ queued -> simulating -> passed | failed -> reviewed -> accepted
 - 相同输入哈希与算法版本默认复用既有结果。
 - `failed` 结果可显式重试，新记录保存 `attempt` 和 `retry_of_id`，不会覆盖旧尝试。
 - `accepted` 只表示离线证据被独立记录，不等于机器人可运行。
+
+### 程序回归基线
+
+每条新完成的运行在同一事务中绑定**当时最新的已接受运行**作为回归基线，匹配条件为同一 `robot_cell_id`、同一 `program_code` 且 `algorithm_version` 一致；版本号（轨迹、联锁、半径）可以不同。没有符合条件的已接受运行时不绑定。
+
+响应中的 `baseline_run_id` 给出绑定基线，`regression` 块按两类发现分别列出差异：
+
+- `collision_diff` / `interlock_diff`：`added`（基线没有的新增发现）、`removed`（基线有而本次消失的发现）、`persisted`（两次都存在的发现）。
+- 碰撞以 `段号 + 区域 ID` 作为稳定身份，联锁以 `代码 + 事件 + 前置（或规范化的环路径）` 作为稳定身份，采样时刻或证据措辞变化不会被误判为回归。
+- `has_new_findings` 为任一类别存在 `added` 即为真。
+
+接受门禁：`reviewed` 运行只要相对绑定基线存在新增发现，`/accept` 返回 409 `new_regression_findings`，即使人工评审已通过；评审通过本身不能接受回归。没有新增发现（发现只是仍存在或消失）时可以正常接受。
+
+基线作废（`/void` 一条 `accepted` 运行）时：
+
+- 所有绑定该基线的运行在同一事务内回退到**上一已接受运行**（按接受时间、再按 ID 排序），差异随之按新基线重新分类；不存在更早的已接受运行时清空绑定。
+- 作废操作记录额外审计动作 `validation_run.baseline_rebound`，包含被作废基线、回退基线和受影响运行数。
+- 校验页和列表接口每次读取都重新计算差异，刷新页面后绑定与分类保持一致。
 
 ## 包络算法、假设与误差边界
 
@@ -191,7 +211,7 @@ queued -> simulating -> passed | failed -> reviewed -> accepted
 | POST | `/validations/:id/review`、`accept`、`void` | 人工处置 |
 | GET | `/audit` | 审计筛选 |
 
-健康端点为 `/healthz` 与 `/readyz`。统一错误码包括 `invalid_geometry`、`invalid_trajectory`、`invalid_program_transition`、`version_conflict`、`state_conflict`、`forbidden` 和 `unauthorized`。
+健康端点为 `/healthz` 与 `/readyz`。统一错误码包括 `invalid_geometry`、`invalid_trajectory`、`invalid_program_transition`、`version_conflict`、`state_conflict`、`new_regression_findings`、`forbidden` 和 `unauthorized`。
 
 ## 环境变量和端口
 
@@ -259,6 +279,9 @@ curl -fsS http://127.0.0.1:18533/api/healthz
 - **409 invalid_program_transition**：按 uploaded -> parsed -> ready -> active 顺序推进。
 - **仿真返回旧结果**：相同输入哈希和算法版本会复用；仅失败结果允许 `retry_failed=true` 创建新尝试。
 - **接受后仍显示风险**：预期行为。人工处置不会篡改碰撞、联锁或风险证据。
+- **评审通过仍无法接受（409 new_regression_findings）**：该运行绑定了已接受基线，且相对基线存在新增碰撞或联锁发现。必须消除新增发现，或先建立新的已接受基线；评审本身不能接受回归。
+- **运行没有基线**：同一工作单元、同一程序代码和算法版本下尚没有 `accepted` 运行。被绑定的基线被作废且没有更早的已接受运行时，绑定也会清空。
+- **基线作废后差异变了**：预期行为。作废已接受基线会把依赖它的运行回退到上一已接受运行并重新分类，刷新页面后一致。
 - **管理员接受返回 403**：如果管理员本人上传了该程序，自审隔离仍然生效。
 
 ## 停止
